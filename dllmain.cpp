@@ -83,6 +83,7 @@ static BOOL CALLBACK identify_livesplit_window(_In_ HWND hWnd, _In_ LPARAM)
 /// <summary>
 /// The worker thread is always run first. It is responsible for finding the LiveSplit window, getting its dimensions
 /// and copying it to an intermediate buffer provided by the main thread.
+/// Uses PrintWindow/BitBlt into a memory DC instead of GetCurrentObject(OBJ_BITMAP) for Wine/Proton compatibility.
 /// </summary>
 /// <returns>0</returns>
 static DWORD WINAPI worker_thread(_In_ LPVOID)
@@ -109,53 +110,122 @@ static DWORD WINAPI worker_thread(_In_ LPVOID)
         {
             if (!IsIconic(g_livesplit_window_handle))
             {
-                // Get device context handle from the LiveSplit window, to get at its buffered image.
-                HDC device_context_handle = GetWindowDC(g_livesplit_window_handle);
-                if (device_context_handle != NULL)
+                // Get the LiveSplit window dimensions.
+                RECT window_rect;
+                if (GetWindowRect(g_livesplit_window_handle, &window_rect))
                 {
-                    // Acquire the bitmap that contains the rendering of LiveSplit.
-                    HBITMAP bitmap_handle = (HBITMAP)GetCurrentObject(device_context_handle, OBJ_BITMAP);
+                    int width = window_rect.right - window_rect.left;
+                    int height = window_rect.bottom - window_rect.top;
 
-                    BITMAPCOREHEADER bitmap_core_header { sizeof(BITMAPCOREHEADER) };
-                    if (GetDIBits(device_context_handle, bitmap_handle, 0, 0, NULL, (LPBITMAPINFO)&bitmap_core_header, DIB_RGB_COLORS))
+                    if (width > 0 && height > 0)
                     {
                         // Inform main thread that it needs to recreate the texture if LiveSplit window size changed.
                         g_create_texture =
-                            bitmap_core_header.bcWidth != g_texture_descriptor.texture.width ||
-                            bitmap_core_header.bcHeight != g_texture_descriptor.texture.height;
+                            (UINT)width != g_texture_descriptor.texture.width ||
+                            (UINT)height != g_texture_descriptor.texture.height;
 
                         if (g_create_texture)
                         {
-                            g_bitmap_info_header.biHeight = -bitmap_core_header.bcHeight;
-                            g_texture_descriptor.texture.width = bitmap_core_header.bcWidth;
-                            g_texture_descriptor.texture.height = bitmap_core_header.bcHeight;
+                            g_bitmap_info_header.biHeight = -height;
+                            g_texture_descriptor.texture.width = width;
+                            g_texture_descriptor.texture.height = height;
                         }
                         else if (g_live_split_window_copy)
                         {
-                            g_have_livesplit_copy = GetDIBits(device_context_handle, bitmap_handle, 0, bitmap_core_header.bcHeight, g_live_split_window_copy, (LPBITMAPINFO)&g_bitmap_info_header, DIB_RGB_COLORS);
-                            if (g_have_livesplit_copy)
+                            // Create a memory DC + bitmap to capture the window contents.
+                            // This approach works on both native Windows and Wine/Proton,
+                            // unlike GetCurrentObject(OBJ_BITMAP) which fails under Wine.
+                            HDC screen_dc = GetDC(NULL);
+                            if (screen_dc != NULL)
                             {
-                                g_destroy_texture &= g_create_texture;
+                                HDC mem_dc = CreateCompatibleDC(screen_dc);
+                                if (mem_dc != NULL)
+                                {
+                                    HBITMAP capture_bitmap = CreateCompatibleBitmap(screen_dc, width, height);
+                                    if (capture_bitmap != NULL)
+                                    {
+                                        HGDIOBJ old_bitmap = SelectObject(mem_dc, capture_bitmap);
+
+                                        // --- CASCADING CAPTURE STRATEGY ---
+                                        int capture_method = 0; // 1: PrintWindow, 2: WindowDC, 3: ScreenDC
+                                        BOOL captured = FALSE;
+
+                                        // Step 1: PrintWindow (PW_RENDERFULLCONTENT = 0x2)
+                                        if (PrintWindow(g_livesplit_window_handle, mem_dc, 0x2))
+                                        {
+                                            // Check if it actually got any data (peek at a few pixels)
+                                            if (GetPixel(mem_dc, width / 2, height / 2) != 0 || GetPixel(mem_dc, width / 4, height / 4) != 0) {
+                                                captured = TRUE;
+                                                capture_method = 1;
+                                            }
+                                        }
+
+                                        // Step 2: BitBlt from Window DC with CAPTUREBLT
+                                        if (!captured)
+                                        {
+                                            HDC window_dc = GetWindowDC(g_livesplit_window_handle);
+                                            if (window_dc != NULL)
+                                            {
+                                                if (BitBlt(mem_dc, 0, 0, width, height, window_dc, 0, 0, SRCCOPY | 0x40000000)) // 0x40000000 = CAPTUREBLT
+                                                {
+                                                    if (GetPixel(mem_dc, width / 2, height / 2) != 0 || GetPixel(mem_dc, width / 4, height / 4) != 0) {
+                                                        captured = TRUE;
+                                                        capture_method = 2;
+                                                    }
+                                                }
+                                                ReleaseDC(g_livesplit_window_handle, window_dc);
+                                            }
+                                        }
+
+                                        // Step 3: BitBlt from Screen DC (Fallback for hardware accelerated windows in Wine)
+                                        if (!captured)
+                                        {
+                                            if (BitBlt(mem_dc, 0, 0, width, height, screen_dc, window_rect.left, window_rect.top, SRCCOPY | 0x40000000))
+                                            {
+                                                captured = TRUE;
+                                                capture_method = 3;
+                                            }
+                                        }
+
+                                        if (captured)
+                                        {
+                                            // Deselect the bitmap before calling GetDIBits.
+                                            SelectObject(mem_dc, old_bitmap);
+                                            g_have_livesplit_copy = GetDIBits(mem_dc, capture_bitmap, 0, height, g_live_split_window_copy, (LPBITMAPINFO)&g_bitmap_info_header, DIB_RGB_COLORS);
+                                            
+                                            if (g_have_livesplit_copy)
+                                            {
+                                                g_destroy_texture &= g_create_texture;
+                                            }
+                                            else
+                                            {
+                                                g_osd_text = "Failed to copy LiveSplit window contents.";
+                                            }
+                                        }
+                                        else
+                                        {
+                                            SelectObject(mem_dc, old_bitmap);
+                                            g_osd_text = "Failed to capture LiveSplit window (all methods failed).";
+                                        }
+
+                                        DeleteObject(capture_bitmap);
+                                    }
+                                    DeleteDC(mem_dc);
+                                }
+                                ReleaseDC(NULL, screen_dc);
                             }
                             else
                             {
-                                g_osd_text = "Failed to copy LiveSplit window contents.";
+                                g_osd_text = "Couldn't acquire screen device context.";
                             }
                         }
                     }
-                    else
-                    {
-                        g_osd_text = "Failed to query buffer format of LiveSplit device context.";
-                    }
-
-                    // Release the device context from LiveSplit so it can continue rendering.
-                    ReleaseDC(g_livesplit_window_handle, device_context_handle);
                 }
                 else
                 {
                     // The LiveSplit window probably closed, let's search for it again next time.
                     g_livesplit_window_handle = NULL;
-                    g_osd_text = "Couldn't acquire LiveSplit device context.";
+                    g_osd_text = "Couldn't get LiveSplit window dimensions.";
                 }
             }
             else
@@ -385,7 +455,7 @@ static void on_reshade_present(_In_ effect_runtime*)
 
 /// <summary>Reacts to effect runtime creation and checks if the LiveSplit overlay is enabled in the addon settings.</summary>
 /// <param name="effect_runtime">The newly initialized ReShade effect runtime.</param>
-static void on_init_swapchain(_In_ swapchain* swapchain)
+static void on_init_swapchain(_In_ swapchain* swapchain, bool)
 {
     // Only react to the first device.
     if (g_device == nullptr)
@@ -402,7 +472,7 @@ static void on_init_swapchain(_In_ swapchain* swapchain)
 
 /// <summary>Reacts to effect runtime desctruction and tears down the LiveSplit overlay.</summary>
 /// <param name="effect_runtime">The effect_runtime being destroyed.</param>
-static void on_destroy_swapchain(_In_ swapchain* swapchain)
+static void on_destroy_swapchain(_In_ swapchain* swapchain, bool)
 {
     // Only react to the device we initially picked up.
     if (g_device == swapchain->get_device())
